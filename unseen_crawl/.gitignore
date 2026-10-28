@@ -1,0 +1,4 @@
+# Crawl HTML cache and all pipeline intermediates.
+cache/
+work/
+__pycache__/

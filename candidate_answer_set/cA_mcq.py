@@ -45,6 +45,17 @@ parser.add_argument(
     "--realtimeQA",
     action="store_true",
 )
+parser.add_argument(
+    "--tag",
+    type=str,
+    default="",
+    help="Tag appended to output directory name (e.g. rebuttal → candidate_answer_set_prompt1_rebuttal)",
+)
+parser.add_argument(
+    "--overwrite",
+    action="store_true",
+    help="Ignore existing output and regenerate from scratch (default: resume)",
+)
 
 args = parser.parse_args()
 
@@ -77,14 +88,14 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = cfg["model_path"]
 MAX_NEW_TOKENS = cfg["max_new_tokens"]
 
-INSERT_DIR = f"Inside-out/{args.model_size}/candidate_answer_set_prompt{args.prompt_id}"
+_tag = f"_{args.tag}" if args.tag else ""
+INSERT_DIR = f"Inside-out/{args.model_size}/candidate_answer_set_prompt{args.prompt_id}{_tag}"
 
 NUM_SAMPLES = 10
 TEMPERATURE = 1.0
 
 BASE_PREFIX = "/mnt/PK"
-#DATASET_DIR = "dataset"
-DATASET_DIR = "MCQ"
+DATASET_DIRS = ["MCQ", "dataset"]
 INPUT_JSONL = args.input_jsonl
 
 random.seed(42)
@@ -94,13 +105,15 @@ random.seed(42)
 ########################################
 
 def build_output_path(input_path: str) -> str:
-    expected_prefix = os.path.join(BASE_PREFIX, DATASET_DIR)
-
-    if not input_path.startswith(expected_prefix):
-        raise ValueError(f"input_jsonl must start with {expected_prefix}")
-
-    relative_path = os.path.relpath(input_path, expected_prefix)
-    return os.path.join(BASE_PREFIX, INSERT_DIR, relative_path)
+    for dataset_dir in DATASET_DIRS:
+        expected_prefix = os.path.join(BASE_PREFIX, dataset_dir)
+        if input_path.startswith(expected_prefix):
+            relative_path = os.path.relpath(input_path, expected_prefix)
+            return os.path.join(BASE_PREFIX, INSERT_DIR, relative_path)
+    raise ValueError(
+        f"input_jsonl must start with one of: "
+        + ", ".join(os.path.join(BASE_PREFIX, d) for d in DATASET_DIRS)
+    )
 
 
 OUTPUT_JSONL = build_output_path(INPUT_JSONL)
@@ -109,19 +122,31 @@ OUTPUT_JSONL = build_output_path(INPUT_JSONL)
 # Model loading
 ########################################
 
-tokenizer = AutoTokenizer.from_pretrained(
-    MODEL_PATH,
-    trust_remote_code=True
-)
+# Loaded lazily so that an already-completed run can exit before paying the
+# model-loading cost (matters for 32B).
+tokenizer = None
+model = None
 
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_PATH,
-    torch_dtype=torch.float16,
-    device_map="auto",
-    trust_remote_code=True
-)
 
-model.eval()
+def load_model():
+    global tokenizer, model
+
+    if model is not None:
+        return
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_PATH,
+        trust_remote_code=True
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        trust_remote_code=True
+    )
+
+    model.eval()
 
 ########################################
 # Prompt
@@ -433,54 +458,120 @@ def count_lines(path):
     with open(path) as f:
         return sum(1 for _ in f)
 
-def process_dataset(input_path: str, output_path: str):
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    total_lines = count_lines(input_path)
+########################################
+# Resume support
+########################################
+
+def load_tasks(input_path: str) -> List[Dict]:
+    """Read the input file into (qid, question, choices, gold_index) tasks."""
+    tasks = []
+
+    with open(input_path, "r", encoding="utf-8") as fin:
+        for line_idx, line in enumerate(fin):
+            line = line.strip()
+            if not line:
+                continue
+            ex = json.loads(line)
+
+            if args.realtimeQA:
+                # questions without a gold answer are skipped entirely
+                if "answer" not in ex:
+                    continue
+                tasks.append({
+                    "qid": ex["question_id"],
+                    "question": ex["question_sentence"],
+                    "choices": ex["choices"],
+                    "gold_index": int(ex["answer"][0]),
+                })
+            else:
+                task = json.loads(ex["task_sample"])
+                tasks.append({
+                    "qid": f"{ex.get('entity', 'unknown')}_{line_idx}",
+                    "question": task["question"],
+                    "choices": task["options"],
+                    "gold_index": ord(task["answer"].upper()) - ord("A"),
+                })
+
+    return tasks
+
+
+def scan_completed(output_path: str) -> set:
+    """
+    Inspect an existing (possibly truncated) output file and return the set of
+    qids that were fully written.
+
+    A question is complete only once its "gold" row — the last row written for
+    that question — is present. Rows of incomplete questions and any malformed
+    trailing line are dropped, and the file is rewritten so that generation can
+    safely append from there.
+    """
+    if not os.path.exists(output_path):
+        return set()
+
+    kept = []          # (qid, line) for every parsable row
+    completed = set()
+    broken_tail = False
+
+    with open(output_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                row_id = row["id"]
+            except (json.JSONDecodeError, KeyError, TypeError):
+                # only ever expected on the final line of a killed run
+                broken_tail = True
+                continue
+
+            qid = row_id.rsplit("_", 1)[0]
+            kept.append((qid, line))
+            if row.get("source") == "gold":
+                completed.add(qid)
+
+    survivors = [line for qid, line in kept if qid in completed]
+    dropped = len(kept) - len(survivors)
+
+    if dropped or broken_tail:
+        tmp_path = output_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for line in survivors:
+                f.write(line + "\n")
+        os.replace(tmp_path, output_path)
+        print(
+            f"↩️  Trimmed {dropped} row(s) from an incomplete question "
+            f"(+{'1 corrupt line' if broken_tail else 'no corrupt line'})"
+        )
+
+    return completed
+
+
+def process_tasks(tasks: List[Dict], output_path: str, completed: set):
+    """Generate candidates for the pending tasks, appending as we go."""
+    pending = [t for t in tasks if t["qid"] not in completed]
+
+    desc = "⚡ RealtimeQA questions" if args.realtimeQA else "📘 Processing questions"
 
     with tqdm(
-        total=total_lines,
-        desc="📘 Processing questions",
+        total=len(tasks),
+        initial=len(tasks) - len(pending),
+        desc=desc,
         file=sys.stderr,
         dynamic_ncols=True
     ) as qbar:
 
-        with open(input_path, "r", encoding="utf-8") as fin, \
-             open(output_path, "w", encoding="utf-8") as fout:
-
-            for line_idx, line in enumerate(fin):
-                ex = json.loads(line)
-                task = json.loads(ex["task_sample"])
-
-                question = task["question"]
-                choices = task["options"]
-                gold_index = ord(task["answer"].upper()) - ord("A")
-
-                qid = f"{ex.get('entity', 'unknown')}_{line_idx}"
-
-                rows = build_candidate_rows(qid, question, choices, gold_index)
+        with open(output_path, "a", encoding="utf-8") as fout:
+            for t in pending:
+                rows = build_candidate_rows(
+                    t["qid"], t["question"], t["choices"], t["gold_index"]
+                )
                 for row in rows:
                     fout.write(json.dumps(row, ensure_ascii=False) + "\n")
-
+                # flush per question so a kill can lose at most one question
+                fout.flush()
+                os.fsync(fout.fileno())
                 qbar.update(1)
-
-def process_dataset_realtimeQA(input_path, output_path):
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    total = count_lines(input_path)
-
-    with tqdm(total=total, desc="⚡ RealtimeQA questions", file=sys.stderr) as bar, \
-         open(input_path) as fin, open(output_path, "w") as fout:
-
-        for line in fin:
-            ex = json.loads(line)
-            rows = build_candidate_rows(
-                ex["question_id"],
-                ex["question_sentence"],
-                ex["choices"],
-                int(ex["answer"][0])
-            )
-            for r in rows:
-                fout.write(json.dumps(r, ensure_ascii=False) + "\n")
-            bar.update(1)
 
 ########################################
 # Run
@@ -489,10 +580,28 @@ def process_dataset_realtimeQA(input_path, output_path):
 if __name__ == "__main__":
     start = time.time()
 
-    if args.realtimeQA:
-        process_dataset_realtimeQA(INPUT_JSONL, OUTPUT_JSONL)
+    os.makedirs(os.path.dirname(OUTPUT_JSONL), exist_ok=True)
+
+    tasks = load_tasks(INPUT_JSONL)
+
+    if args.overwrite:
+        if os.path.exists(OUTPUT_JSONL):
+            os.remove(OUTPUT_JSONL)
+        completed = set()
     else:
-        process_dataset(INPUT_JSONL, OUTPUT_JSONL)
+        completed = scan_completed(OUTPUT_JSONL)
+
+    remaining = [t for t in tasks if t["qid"] not in completed]
+
+    print(f"📂 Output: {OUTPUT_JSONL}")
+    print(f"📊 {len(completed)}/{len(tasks)} questions already done, {len(remaining)} to go")
+
+    if not remaining:
+        print("✅ Already complete — skipping (use --overwrite to regenerate)")
+        sys.exit(0)
+
+    load_model()
+    process_tasks(tasks, OUTPUT_JSONL, completed)
 
     elapsed = time.time() - start
     print(f"\n✅ Model: {args.model_size}")

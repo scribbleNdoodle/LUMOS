@@ -7,6 +7,7 @@ CUDA_VISIBLE_DEVICES=0 python external/normP.py \
 """
 
 import os
+import re
 import argparse
 import json
 import math
@@ -30,7 +31,7 @@ parser.add_argument(
     "--prompt_id",
     type=int,
     required=True,
-    choices=[1, 2, 3],
+    choices=[1, 2, 3, 4],
 )
 parser.add_argument(
     "--input_jsonl",
@@ -58,8 +59,10 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 ########################################
 
 BASE_PREFIX = "/mnt/PK"
-OLD_MIDDLE = f"Inside-out/{args.model_size}/internal_prompt{args.prompt_id}"
-NEW_MIDDLE = f"Inside-out/{args.model_size}/external_prompt{args.prompt_id}"
+_tag_match = re.search(r"/internal_prompt\d+(_\w+)?/", args.input_jsonl)
+_tag = _tag_match.group(1) or "" if _tag_match else ""
+OLD_MIDDLE = f"Inside-out/{args.model_size}/internal_prompt{args.prompt_id}{_tag}"
+NEW_MIDDLE = f"Inside-out/{args.model_size}/external_prompt{args.prompt_id}{_tag}"
 
 def build_output_path(input_path: str) -> str:
     expected_prefix = os.path.join(BASE_PREFIX, OLD_MIDDLE)

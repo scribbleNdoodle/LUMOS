@@ -39,17 +39,18 @@ def build_output_paths(input_jsonl: str):
     *_ABCD.jsonl → *_probing.jsonl / *_labeling.jsonl
     """
 
-    m = re.search(r"/candidate_answer_set_prompt(\d+)/", input_jsonl)
+    m = re.search(r"/candidate_answer_set_prompt(\d+)(_\w+)?/", input_jsonl)
     if not m:
         raise ValueError(
-            "input_jsonl must contain /candidate_answer_set_promptX/"
+            "input_jsonl must contain /candidate_answer_set_promptX/ or /candidate_answer_set_promptX_tag/"
         )
 
     prompt_id = m.group(1)
+    tag = m.group(2) or ""
 
     base_path1 = input_jsonl.replace(
-        f"/candidate_answer_set_prompt{prompt_id}/",
-        f"/internal_prompt{prompt_id}/"
+        f"/candidate_answer_set_prompt{prompt_id}{tag}/",
+        f"/internal_prompt{prompt_id}{tag}/"
     )
     base_path = base_path1.replace(
         f"/final/",
